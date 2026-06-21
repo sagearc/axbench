@@ -215,3 +215,8 @@ cython_debug/
 *.pkl
 *.pdf
 axbench/scripts/paper/
+
+# Custom
+Taskfile.yml
+results
+context
