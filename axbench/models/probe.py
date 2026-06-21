@@ -1,14 +1,12 @@
 from .model import Model
 import torch, transformers, datasets
 from tqdm.auto import tqdm
-import os
-import pandas as pd
 from pyvene import (
     IntervenableConfig,
     IntervenableModel
 )
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Union, List, Any
+from dataclasses import dataclass
+from typing import Dict, Sequence
 from torch.utils.data import DataLoader
 from .interventions import (
     AdditionIntervention,
@@ -17,13 +15,10 @@ from .interventions import (
     SparseProbeIntervention
 )
 from ..utils.model_utils import (
-    set_decoder_norm_to_unit_norm, 
-    remove_gradient_parallel_to_decoder_directions,
     gather_residual_activations, 
-    get_lr,
-    calculate_l1_losses
 )
-from transformers import get_scheduler
+from ..utils.probe_training import train_probe_direction, unit_norm
+from ..utils.realizable_basis import resolve_or_build_projector
 
 import logging
 logging.basicConfig(format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
@@ -94,6 +89,40 @@ class LinearProbe(Model):
     def __str__(self):
         return 'LinearProbe'
 
+    def _training_arg(self, name, default=None):
+        return getattr(self.training_args, name, default) if self.training_args is not None else default
+
+    def _probe_transform(self, **kwargs):
+        return kwargs.get(
+            "direction_transform",
+            kwargs.get(
+                "probe_transform",
+                self._training_arg("direction_transform", self._training_arg("probe_transform", "none")),
+            ),
+        )
+
+    @torch.no_grad()
+    def _activation_dataset(self, train_dataloader, prefix_length: int):
+        activations, labels = [], []
+        for batch in train_dataloader:
+            inputs = {k: v.to(self.device) for k, v in batch.items()}
+            acts = gather_residual_activations(
+                self.model,
+                self.layer,
+                {
+                    "input_ids": inputs["input_ids"],
+                    "attention_mask": inputs["attention_mask"],
+                },
+            ).detach()
+            mask = inputs["intervention_masks"].bool()
+            token_acts = acts[:, prefix_length : prefix_length + mask.shape[1]]
+            expanded_labels = inputs["labels"].unsqueeze(-1).expand_as(mask)
+            activations.append(token_acts[mask].detach().cpu().float())
+            labels.append(expanded_labels[mask].detach().cpu().float())
+        if not activations:
+            raise ValueError("No probe activations were collected.")
+        return torch.cat(activations, dim=0), torch.cat(labels, dim=0)
+
     def make_model(self, **kwargs):
         mode = kwargs.get("mode", "latent")
         if mode == "steering":
@@ -135,70 +164,37 @@ class LinearProbe(Model):
     def train(self, examples, **kwargs):
         train_dataloader = self.make_dataloader(examples, **kwargs)
         torch.cuda.empty_cache()
+        transform = self._probe_transform(**kwargs)
+        if transform not in {"none", "projected_gradient", "projected_activations"}:
+            raise ValueError(f"Unknown probe transform: {transform!r}")
 
-        # Optimizer and lr
-        optimizer = torch.optim.AdamW(
-            self.ax.parameters(), lr=self.training_args.lr, 
-            weight_decay=self.training_args.weight_decay)
-        num_training_steps = self.training_args.n_epochs * len(train_dataloader)
-        lr_scheduler = get_scheduler(
-            "linear", optimizer=optimizer,
-            num_warmup_steps=0, num_training_steps=num_training_steps)
-        criterion = torch.nn.BCELoss()
-        # Main training loop.
-        rank = torch.distributed.get_rank()
-        progress_bar, curr_step = tqdm(range(num_training_steps), position=rank, leave=True), 0
-        
-        for epoch in range(self.training_args.n_epochs):
-            for batch in train_dataloader:
-                # prepare input
-                inputs = {k: v.to(self.device) for k, v in batch.items()}
-                unit_locations={"sources->base": (
-                    None,
-                    inputs["intervention_locations"].permute(1, 0, 2).tolist()
-                )}
-                subspaces = [{
-                    "k": self.training_args.topk
-                }]
-        
-                # forward (we don't care about the model outputs since no causal intervention only probing)
-                _, _ = self.ax_model(
-                    base={
-                        "input_ids": inputs["input_ids"],
-                        "attention_mask": inputs["attention_mask"]
-                    }, unit_locations=unit_locations, subspaces=subspaces, use_cache=False)
-                
-                latent = self.ax_model.full_intervention_outputs[0].latent[0] # bs, n_tokens
-                preds = torch.sigmoid(latent) # bs, n_tokens
-                expanded_labels = inputs["labels"].unsqueeze(-1).expand_as(preds) # bs, n_tokens
-                # Compute loss only on valid tokens
-                loss = criterion(
-                    preds[inputs["intervention_masks"].bool()].float(), 
-                    expanded_labels[inputs["intervention_masks"].bool()].float()
-                )
-                l1_loss = sum(p.abs().sum() for p in self.ax.parameters())
-                loss += self.training_args.coeff_l1_loss*l1_loss
-                
-                # accuracy
-                pred_labels = (preds > 0.5).long()
-                acc = (pred_labels[inputs["intervention_masks"].bool()] == 
-                       expanded_labels[inputs["intervention_masks"].bool()]).float().mean()
+        projector = resolve_or_build_projector(self, examples, kwargs) if transform != "none" else None
+        if transform in {"projected_gradient", "projected_activations"} and projector is None:
+            raise ValueError(f"Probe transform {transform!r} requires a realizable basis/projector.")
 
-                # grads
-                loss.backward()
-                set_decoder_norm_to_unit_norm(self.ax)
-                remove_gradient_parallel_to_decoder_directions(self.ax)
-                curr_step += 1
-                curr_lr = get_lr(optimizer)
-                # optim
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                progress_bar.set_description(
-                    "lr %.6f || loss %.6f || acc %.3f" % (
-                        curr_lr, loss, acc))
-        progress_bar.close()
+        prefix_length = int(kwargs.get("prefix_length", 1))
+        X, y = self._activation_dataset(train_dataloader, prefix_length)
+        if transform == "projected_activations":
+            X = projector.project(X)
+
+        cfg = {
+            "device": self.device,
+            "seed": self.seed,
+            "epochs": self._training_arg("n_epochs", 50),
+            "lr": self._training_arg("lr", 1e-4),
+            "batch_size": self._training_arg("batch_size", 4096),
+            "weight_decay": self._training_arg("weight_decay", 0.0),
+            "project_gradients": self._training_arg("project_gradients", False),
+        }
+        probe_projector = projector if transform == "projected_gradient" else None
+        direction = train_probe_direction(X, y, cfg, projector=probe_projector)
+        if transform == "projected_activations":
+            direction = unit_norm(projector.project(direction)).squeeze(0)
+
+        self.ax.proj.weight.data[0].copy_(direction.to(self.ax.proj.weight.device, dtype=self.ax.proj.weight.dtype))
+        if self.ax.proj.bias is not None:
+            self.ax.proj.bias.data.zero_()
+        logger.warning("Training finished.")
 
     @torch.no_grad()
     def predict_latent(self, examples, **kwargs):

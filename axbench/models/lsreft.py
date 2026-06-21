@@ -24,6 +24,8 @@ from ..utils.model_utils import (
     get_lr,
     calculate_l1_losses
 )
+from ..utils.realizable_basis import resolve_or_build_projector
+from ..utils.subspace_training import ProjectedOptimizer
 from transformers import get_scheduler
 from transformers import set_seed
 from ..scripts.inference import prepare_df
@@ -85,14 +87,36 @@ class LsReFT(Model):
     def train(self, examples, **kwargs):
         train_dataloader = self.make_dataloader(examples, **kwargs)
         torch.cuda.empty_cache()
+        transform = kwargs.get(
+            "direction_transform",
+            kwargs.get(
+                "reft_transform",
+                getattr(self.training_args, "direction_transform", getattr(self.training_args, "reft_transform", "none")),
+            ),
+        )
+        if transform not in {"none", "projected_gradient"}:
+            raise ValueError("LsReFT only supports direction_transform='none' or 'projected_gradient'.")
+        projector = resolve_or_build_projector(self, examples, kwargs) if transform == "projected_gradient" else None
 
         # Optimizer and lr
-        optimizer = torch.optim.AdamW(
+        base_optimizer = torch.optim.AdamW(
             self.ax_model.parameters(), 
             lr=self.training_args.lr, weight_decay=self.training_args.weight_decay)
+        optimizer = (
+            ProjectedOptimizer(
+                base_optimizer,
+                [self.ax.proj.weight],
+                projector,
+                project_gradients=bool(getattr(self.training_args, "project_gradients", False)),
+            )
+            if projector is not None
+            else base_optimizer
+        )
+        if projector is not None:
+            set_decoder_norm_to_unit_norm(self.ax)
         num_training_steps = self.training_args.n_epochs * (len(train_dataloader) // self.training_args.gradient_accumulation_steps)
         lr_scheduler = get_scheduler(
-            "linear", optimizer=optimizer,
+            "linear", optimizer=base_optimizer,
             num_warmup_steps=0, num_training_steps=num_training_steps)
         norm_loss_fn = torch.nn.MSELoss()
         # Main training loop.
@@ -142,6 +166,8 @@ class LsReFT(Model):
                     curr_lr = get_lr(optimizer)
                     # optim
                     optimizer.step()
+                    if projector is not None:
+                        set_decoder_norm_to_unit_norm(self.ax)
                     lr_scheduler.step()
                     optimizer.zero_grad()
                     progress_bar.update(1)

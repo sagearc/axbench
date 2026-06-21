@@ -18,10 +18,12 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from huggingface_hub import hf_hub_download
 from pathlib import Path
-from args.training_args import TrainingArgs
-from args.dataset_args import DatasetArgs
+from types import SimpleNamespace
+from axbench.scripts.args.training_args import TrainingArgs
+from axbench.scripts.args.dataset_args import DatasetArgs
 from axbench.utils.constants import * 
 from axbench.utils.model_utils import get_prefix_length, get_suffix_length
+from axbench.utils.realizable_basis import resolve_or_build_projector
 from transformers import set_seed
 import torch.distributed as dist
 import sys
@@ -40,6 +42,63 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = "config.json"
 STATE_FILE = "train_state.pkl"
 METADATA_FILE = "metadata.jsonl"
+REALIZABLE_TRANSFORMS = {"projected_gradient", "projected_activations"}
+METHOD_TRANSFORM_FIELDS = {
+    "LinearProbe": "probe_transform",
+    "DiffMean": "diffmean_transform",
+    "LsReFT": "reft_transform",
+}
+
+
+def resolved_direction_transform(model_name, model_params):
+    direction_transform = getattr(model_params, "direction_transform", "none")
+    if direction_transform not in {None, "none"}:
+        return direction_transform
+    method_field = METHOD_TRANSFORM_FIELDS.get(model_name)
+    if method_field is None:
+        return "none"
+    return getattr(model_params, method_field, "none") or "none"
+
+
+def first_realizable_model_params(models):
+    for model_name in sorted(models.keys()):
+        if model_name == "HyperSteer":
+            continue
+        model_params = models[model_name]
+        if resolved_direction_transform(model_name, model_params) in REALIZABLE_TRANSFORMS:
+            return model_name, model_params
+    return None, None
+
+
+def build_shared_realizable_projector(
+    model_instance,
+    tokenizer,
+    layer,
+    device,
+    seed,
+    model_params,
+    examples,
+    prefix_length,
+    readout_examples=None,
+):
+    owner = SimpleNamespace(
+        model=model_instance,
+        tokenizer=tokenizer,
+        layer=layer,
+        device=device,
+        training_args=model_params,
+        seed=seed,
+    )
+    kwargs = {"prefix_length": prefix_length}
+    if readout_examples is not None:
+        kwargs["readout_examples"] = readout_examples
+    return resolve_or_build_projector(owner, examples, kwargs)
+
+
+def add_realizable_projector_kwargs(kwargs, projector, transform):
+    if projector is not None and transform in REALIZABLE_TRANSFORMS:
+        kwargs["projector"] = projector
+        kwargs["realizable_projector"] = projector
 
 
 def data_generator(data_dir, use_dpo_loss=False):
@@ -202,6 +261,40 @@ def prepare_df(
             print("=====================\n")
 
         return all_df # do nothing, the task will be standard instruction tuning.
+
+
+def prepare_realizable_basis_df(
+    original_df,
+    negative_df,
+    concept,
+    metadata,
+    max_num_of_examples=None,
+):
+    genre = metadata["concept_genres_map"][concept][0]
+    positive_df = original_df[
+        (original_df["output_concept"] == concept) & (original_df["category"] == "positive")
+    ].copy()
+    negative_df = negative_df[negative_df["concept_genre"] == genre].copy()
+    if max_num_of_examples:
+        positive_df = positive_df.head(max_num_of_examples // 2)
+        negative_df = negative_df.head(max_num_of_examples // 2)
+
+    def to_basis_rows(df, label):
+        rows = pd.DataFrame(
+            {
+                "prefix": df["input"].astype(str),
+                "completion": df["output"].astype(str),
+            }
+        )
+        rows["text"] = rows["prefix"] + rows["completion"]
+        rows["labels"] = int(label)
+        rows["label"] = int(label)
+        return rows
+
+    return pd.concat(
+        [to_basis_rows(positive_df, 1), to_basis_rows(negative_df, 0)],
+        axis=0,
+    ).reset_index(drop=True)
 
 
 def partition_list(lst, n):
@@ -431,12 +524,48 @@ def main():
             logger.warning(f"Rank {rank} skipping concept_id {concept_id} because it is already processed")
             continue
         logger.warning(f"Training models for concept_id {concept_id} on rank {rank}")
+        concept = metadata[concept_id]["concept"]
+        shared_realizable_projector = None
+        projector_model_name, projector_model_params = first_realizable_model_params(args.models)
+        if projector_model_params is not None:
+            logger.warning(
+                f"Building shared realizable projector for concept {concept} "
+                f"from {projector_model_name} basis settings"
+            )
+            if projector_model_params.realizable_basis_path:
+                projector_df = concept_df.copy()
+                projector_readout_df = None
+            else:
+                projector_df = prepare_realizable_basis_df(
+                    concept_df.copy(),
+                    negative_df,
+                    concept,
+                    metadata[concept_id],
+                    max_num_of_examples=args.max_num_of_examples,
+                )
+                projector_readout_df = prepare_realizable_basis_df(
+                    concept_df.copy(),
+                    negative_df,
+                    concept,
+                    metadata[concept_id],
+                    max_num_of_examples=None,
+                )
+            shared_realizable_projector = build_shared_realizable_projector(
+                model_instance,
+                tokenizer,
+                args.layer,
+                device,
+                args.seed,
+                projector_model_params,
+                projector_df,
+                prefix_length,
+                readout_examples=projector_readout_df,
+            )
         for model_name in sorted(args.models.keys()):
             
             if model_name == "HyperSteer":
                 continue # training of HyperSteer is ran separately.
             
-            concept = metadata[concept_id]["concept"]
             logger.warning(f"Training {model_name} with concept {concept}")
             benchmark_model = getattr(axbench, model_name)(
                 model_instance, tokenizer, layer=args.layer,
@@ -485,6 +614,9 @@ def main():
                 "steering_prompt_type": args.models[model_name].steering_prompt_type,
                 "substraction_type": args.models[model_name].substraction_type,
             }
+            transform = resolved_direction_transform(model_name, args.models[model_name])
+            kwargs["direction_transform"] = transform
+            add_realizable_projector_kwargs(kwargs, shared_realizable_projector, transform)
             prepared_df = concept_df.copy()
             prepared_df = prepare_df(
                 prepared_df, negative_df, concept, metadata[concept_id], tokenizer, 
@@ -662,4 +794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
