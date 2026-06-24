@@ -215,3 +215,13 @@ cython_debug/
 *.pkl
 *.pdf
 axbench/scripts/paper/
+
+# Custom
+Taskfile.yml
+results
+context
+.DS_Store
+.gitignore
+.stanza-cache
+*.md
+.matplotlib-cache
