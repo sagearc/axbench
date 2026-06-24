@@ -22,6 +22,7 @@ from ..utils.model_utils import (
     get_lr
 )
 from ..utils.model_utils import calculate_l1_losses
+from ..utils.realizable_basis import resolve_or_build_projector
 from transformers import get_scheduler
 import sklearn.decomposition
 import numpy as np
@@ -139,8 +140,17 @@ class DiffMean(MeanActivation):
     def __str__(self):
         return 'DiffMean'
 
-    @torch.no_grad()
     def train(self, examples, **kwargs):
+        transform = kwargs.get(
+            "direction_transform",
+            kwargs.get(
+                "diffmean_transform",
+                getattr(self.training_args, "direction_transform", getattr(self.training_args, "diffmean_transform", "none")),
+            ),
+        )
+        if transform not in {"none", "projected_activations"}:
+            raise ValueError("DiffMean only supports direction_transform='none' or 'projected_activations'.")
+        projector = resolve_or_build_projector(self, examples, kwargs) if transform == "projected_activations" else None
         train_dataloader = self.make_dataloader(examples)
         torch.cuda.empty_cache()
         self.ax.eval()
@@ -152,12 +162,15 @@ class DiffMean(MeanActivation):
             for batch in train_dataloader:
                 # prepare input
                 inputs = {k: v.to(self.device) for k, v in batch.items()}
-                activations = gather_residual_activations(
-                    self.model, self.layer, 
-                    {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
-                ).detach()
+                with torch.no_grad():
+                    activations = gather_residual_activations(
+                        self.model, self.layer,
+                        {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+                    ).detach()
                 nonbos_mask = inputs["attention_mask"][:,kwargs["prefix_length"]:]
                 activations = activations[:,kwargs["prefix_length"]:][nonbos_mask.bool()]
+                if projector is not None:
+                    activations = projector.project(activations)
                 labels = inputs["labels"].unsqueeze(1).repeat(
                     1, inputs["input_ids"].shape[1] - kwargs["prefix_length"])
                 positive_activations.append(activations[labels[nonbos_mask.bool()] == 1])
@@ -166,6 +179,8 @@ class DiffMean(MeanActivation):
         mean_positive_activation = torch.cat(positive_activations, dim=0).mean(dim=0)
         mean_negative_activation = torch.cat(negative_activations, dim=0).mean(dim=0)
         self.ax.proj.weight.data = mean_positive_activation.unsqueeze(0) - mean_negative_activation.unsqueeze(0)
+        if projector is not None:
+            self.ax.proj.weight.data = projector.project(self.ax.proj.weight.data)
         set_decoder_norm_to_unit_norm(self.ax)
         logger.warning("Training finished.")
 

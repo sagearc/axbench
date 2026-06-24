@@ -51,7 +51,7 @@ class TopKReLUSubspaceIntervention(
         v = torch.stack(v, dim=0).unsqueeze(dim=-1) # bs, h, 1
         
         # get latent
-        latent = torch.relu(torch.bmm(base, v)).squeeze(dim=-1) # bs, s, 1
+        latent = torch.relu(torch.bmm(base.float(), v.float())).squeeze(dim=-1) # bs, s, 1
         topk_acts, topk_indices = latent.topk(k=subspaces["k"], dim=-1, sorted=False)
         non_topk_latent = latent.clone()
         non_topk_latent.scatter_(-1, topk_indices, 0)
@@ -187,6 +187,25 @@ class TopKReLUIntervention(
             self.proj.weight.fill_(0.01)
             self.proj.bias.fill_(0)
 
+    def _latent_for_topk(self, base, v, latent, subspaces):
+        metric = subspaces.get("topk_metric", "activation")
+        if metric in {None, "activation"}:
+            return latent
+        if metric != "realizable_basis":
+            raise ValueError(f"Unknown topk_metric={metric!r}")
+        basis = subspaces.get("topk_basis")
+        if basis is None:
+            raise ValueError("topk_metric='realizable_basis' requires subspaces['topk_basis']")
+        basis = basis.to(device=base.device, dtype=torch.float32)
+        if basis.ndim != 2 or basis.shape[0] != base.shape[-1]:
+            raise ValueError(
+                "topk_basis must have shape [hidden_size, rank], "
+                f"got {tuple(basis.shape)} for hidden_size={base.shape[-1]}"
+            )
+        h_coords = torch.einsum("bsh,hr->bsr", base.float(), basis)
+        v_coords = torch.einsum("bh,hr->br", v.squeeze(dim=-1).float(), basis)
+        return torch.relu(torch.einsum("bsr,br->bs", h_coords, v_coords))
+
     def forward(
         self, base, source=None, subspaces=None
     ):
@@ -200,8 +219,11 @@ class TopKReLUIntervention(
         v = torch.stack(v, dim=0).unsqueeze(dim=-1) # bs, h, 1
         
         # get latent
-        latent = torch.relu(torch.bmm(base, v)).squeeze(dim=-1) # bs, s, 1
-        topk_acts, topk_indices = latent.topk(k=subspaces["k"], dim=-1, sorted=False)
+        latent = torch.relu(torch.bmm(base.float(), v.float())).squeeze(dim=-1) # bs, s, 1
+        topk_latent = self._latent_for_topk(base, v, latent, subspaces)
+        k = min(int(subspaces["k"]), latent.shape[-1])
+        _, topk_indices = topk_latent.topk(k=k, dim=-1, sorted=False)
+        topk_acts = latent.gather(dim=-1, index=topk_indices)
         non_topk_latent = latent.clone()
         non_topk_latent.scatter_(-1, topk_indices, 0)
 
@@ -1023,4 +1045,3 @@ class PreferenceNodireftIntervention(
             output=self.dropout(output.to(base.dtype)),
             latent=[diff]
         )
-
