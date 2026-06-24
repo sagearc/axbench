@@ -96,7 +96,23 @@ class LsReFT(Model):
         )
         if transform not in {"none", "projected_gradient"}:
             raise ValueError("LsReFT only supports direction_transform='none' or 'projected_gradient'.")
-        projector = resolve_or_build_projector(self, examples, kwargs) if transform == "projected_gradient" else None
+        topk_metric = kwargs.get(
+            "topk_metric",
+            getattr(self.training_args, "topk_metric", "activation"),
+        ) or "activation"
+        if topk_metric not in {"activation", "realizable_basis"}:
+            raise ValueError("LsReFT only supports topk_metric='activation' or 'realizable_basis'.")
+        projector = (
+            resolve_or_build_projector(self, examples, kwargs)
+            if transform == "projected_gradient" or topk_metric == "realizable_basis"
+            else None
+        )
+        gradient_projector = projector if transform == "projected_gradient" else None
+        topk_basis = (
+            projector.basis.to(device=self.device, dtype=torch.float32)
+            if topk_metric == "realizable_basis"
+            else None
+        )
 
         # Optimizer and lr
         base_optimizer = torch.optim.AdamW(
@@ -106,13 +122,13 @@ class LsReFT(Model):
             ProjectedOptimizer(
                 base_optimizer,
                 [self.ax.proj.weight],
-                projector,
+                gradient_projector,
                 project_gradients=bool(getattr(self.training_args, "project_gradients", False)),
             )
-            if projector is not None
+            if gradient_projector is not None
             else base_optimizer
         )
-        if projector is not None:
+        if gradient_projector is not None:
             set_decoder_norm_to_unit_norm(self.ax)
         num_training_steps = self.training_args.n_epochs * (len(train_dataloader) // self.training_args.gradient_accumulation_steps)
         lr_scheduler = get_scheduler(
@@ -131,9 +147,13 @@ class LsReFT(Model):
                     None,
                     inputs["intervention_locations"].permute(1, 0, 2).tolist()
                 )}
-                subspaces = [{
-                    "k": self.training_args.topk
-                }]
+                subspace = {
+                    "k": self.training_args.topk,
+                    "topk_metric": topk_metric,
+                }
+                if topk_basis is not None:
+                    subspace["topk_basis"] = topk_basis
+                subspaces = [subspace]
         
                 # forward
                 _, cf_outputs = self.ax_model(
@@ -166,7 +186,7 @@ class LsReFT(Model):
                     curr_lr = get_lr(optimizer)
                     # optim
                     optimizer.step()
-                    if projector is not None:
+                    if gradient_projector is not None:
                         set_decoder_norm_to_unit_norm(self.ax)
                     lr_scheduler.step()
                     optimizer.zero_grad()

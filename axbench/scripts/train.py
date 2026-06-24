@@ -60,12 +60,23 @@ def resolved_direction_transform(model_name, model_params):
     return getattr(model_params, method_field, "none") or "none"
 
 
+def uses_realizable_topk(model_name, model_params):
+    return model_name == "LsReFT" and getattr(model_params, "topk_metric", "activation") == "realizable_basis"
+
+
+def needs_realizable_projector(model_name, model_params):
+    return (
+        resolved_direction_transform(model_name, model_params) in REALIZABLE_TRANSFORMS
+        or uses_realizable_topk(model_name, model_params)
+    )
+
+
 def first_realizable_model_params(models):
     for model_name in sorted(models.keys()):
         if model_name == "HyperSteer":
             continue
         model_params = models[model_name]
-        if resolved_direction_transform(model_name, model_params) in REALIZABLE_TRANSFORMS:
+        if needs_realizable_projector(model_name, model_params):
             return model_name, model_params
     return None, None
 
@@ -95,8 +106,8 @@ def build_shared_realizable_projector(
     return resolve_or_build_projector(owner, examples, kwargs)
 
 
-def add_realizable_projector_kwargs(kwargs, projector, transform):
-    if projector is not None and transform in REALIZABLE_TRANSFORMS:
+def add_realizable_projector_kwargs(kwargs, projector, transform, *, needs_projector=False):
+    if projector is not None and (transform in REALIZABLE_TRANSFORMS or needs_projector):
         kwargs["projector"] = projector
         kwargs["realizable_projector"] = projector
 
@@ -616,7 +627,13 @@ def main():
             }
             transform = resolved_direction_transform(model_name, args.models[model_name])
             kwargs["direction_transform"] = transform
-            add_realizable_projector_kwargs(kwargs, shared_realizable_projector, transform)
+            kwargs["topk_metric"] = getattr(args.models[model_name], "topk_metric", "activation") or "activation"
+            add_realizable_projector_kwargs(
+                kwargs,
+                shared_realizable_projector,
+                transform,
+                needs_projector=uses_realizable_topk(model_name, args.models[model_name]),
+            )
             prepared_df = concept_df.copy()
             prepared_df = prepare_df(
                 prepared_df, negative_df, concept, metadata[concept_id], tokenizer, 

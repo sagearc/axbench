@@ -84,6 +84,7 @@ class ModelParams:
     probe_transform: Optional[str] = "none"
     diffmean_transform: Optional[str] = "none"
     reft_transform: Optional[str] = "none"
+    topk_metric: Optional[str] = "activation"
     realizable_basis_path: Optional[str] = None
     basis_rank: Optional[int] = 32
     basis_contexts_per_class: Optional[int] = 128
@@ -140,7 +141,7 @@ class TrainingArgs:
             'intervention_positions_dropout', 'dropout', 'preference_pairs', 'steering_prompt_type',
             'hypernet_name_or_path', 'hypernet_initialize_from_pretrained', "num_hidden_layers",
             'direction_transform', 'probe_transform', 'diffmean_transform', 'reft_transform',
-            'realizable_basis_path', 'basis_rank', 'basis_contexts_per_class',
+            'topk_metric', 'realizable_basis_path', 'basis_rank', 'basis_contexts_per_class',
             'basis_activation_batch_size', 'max_length', 'readout_smoothing', 'readout_clip',
             'project_gradients'
         ]
@@ -291,7 +292,7 @@ class TrainingArgs:
             'intervention_type', 'reft_positions', 'reft_type', 'overwrite_data_dir',
             'overwrite_metadata_dir', 'overwrite_inference_data_dir', 'bow_penalty', 'loss_type',
             'wandb_project', 'wandb_name', 'steering_prompt_type', 'direction_transform',
-            'probe_transform', 'diffmean_transform', 'reft_transform', 'realizable_basis_path',
+            'probe_transform', 'diffmean_transform', 'reft_transform', 'topk_metric', 'realizable_basis_path',
         ]
         list_params = ['intervention_layers', 'reft_layers', 'lora_layers', 'lora_components', 'steering_factors', 'preference_pairs']
 

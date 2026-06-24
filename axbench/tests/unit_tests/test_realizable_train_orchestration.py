@@ -19,6 +19,7 @@ def model_params(**overrides):
         "probe_transform": "none",
         "diffmean_transform": "none",
         "reft_transform": "none",
+        "topk_metric": "activation",
     }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -51,6 +52,18 @@ def test_first_realizable_model_params_finds_transformed_method():
     assert params is projected
 
 
+def test_first_realizable_model_params_finds_realizable_topk_method():
+    raw = model_params()
+    basis_topk = model_params(topk_metric="realizable_basis")
+
+    model_name, params = train_module.first_realizable_model_params(
+        {"DiffMean": raw, "LsReFT": basis_topk}
+    )
+
+    assert model_name == "LsReFT"
+    assert params is basis_topk
+
+
 def test_add_realizable_projector_kwargs_only_for_transformed_methods():
     projector = object()
     kwargs = {}
@@ -63,6 +76,21 @@ def test_add_realizable_projector_kwargs_only_for_transformed_methods():
     raw_kwargs = {}
     train_module.add_realizable_projector_kwargs(raw_kwargs, projector, "none")
     assert raw_kwargs == {}
+
+
+def test_add_realizable_projector_kwargs_for_realizable_topk():
+    projector = object()
+    kwargs = {}
+
+    train_module.add_realizable_projector_kwargs(
+        kwargs,
+        projector,
+        "none",
+        needs_projector=True,
+    )
+
+    assert kwargs["projector"] is projector
+    assert kwargs["realizable_projector"] is projector
 
 
 def test_prepare_realizable_basis_df_preserves_prefix_completion_boundary():
