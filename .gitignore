@@ -220,3 +220,8 @@ axbench/scripts/paper/
 Taskfile.yml
 results
 context
+.DS_Store
+.gitignore
+.stanza-cache
+*.md
+.matplotlib-cache
